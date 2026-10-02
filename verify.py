@@ -1,10 +1,12 @@
 """Compose verify 服务的一次性验收脚本。
 
 依次执行：
-  1. 领域测试（unittest，覆盖同锚点并发插入、墓碑后插入、冲突拒绝等）
+  1. 领域测试（unittest，覆盖 2~4 支的同锚点并发插入、墓碑后插入、
+     幂等合并、跨第三支冲突拒绝、分组无关性、双支回归等）
   2. 构建检查（py_compile 全量语法编译）
-  3. HTTP 冒烟：健康响应、页面可达、三组关键场景的 API 裁定
-     （同锚点并发插入 / 墓碑后插入 / 冲突拒绝）
+  3. HTTP 冒烟：健康响应、页面可达、六组关键场景的 API 裁定
+     （A 双支同锚点 / B 双支幂等 / C 双支冲突 / D 四支同锚点统一裁定
+     与分组无关 / E 四支跨第三支冲突 / F 双支响应回归）
 
 全部通过以退出码 0 报告验收成功；任一失败退出码非 0。
 """
@@ -93,8 +95,9 @@ def main() -> int:
     req = urllib.request.Request(WEB_URL + "/")
     with urllib.request.urlopen(req, timeout=5) as resp:
         page = resp.read().decode("utf-8")
-    check("页面 GET / 可达且包含复核工作台标记",
-          resp.status == 200 and "双支离线修订" in page and "/api/merge" in page,
+    check("页面 GET / 可达且包含多支复核工作台标记",
+          resp.status == 200 and "多支离线修订" in page and "/api/merge" in page
+          and "至多四支" in page,
           f"status={resp.status}, bytes={len(page)}")
 
     for asset in ("/app.js", "/styles.css"):
@@ -210,6 +213,106 @@ def main() -> int:
     check("场景C3 悬空锚点引用被拒绝",
           status == 200 and res.get("ok") is False
           and res["conflict"]["code"] == "DANGLING_ANCHOR")
+
+    # 场景 D：四支同锚点并发插入 —— 在同一墓碑序列上统一裁定，不做两两合并
+    four = {
+        "baseline": [
+            {"id": "A", "text": "绕机检查"},
+            {"id": "B", "text": "襟翼起飞位"},
+            {"id": "C", "text": "核对简令"}
+        ],
+        "branches": [
+            {"name": "alpha", "ops": [
+                {"op_id": "A1", "kind": "INSERT", "new_id": "a-LTANK", "anchor": "B", "text": "左翼油箱复查"},
+                {"op_id": "A2", "kind": "INSERT", "new_id": "a-ENG", "anchor": "B", "text": "左发滑油复查"},
+                {"op_id": "A3", "kind": "DELETE", "target": "B"},
+                {"op_id": "A4", "kind": "INSERT", "new_id": "a-TOMB", "anchor": "B", "text": "墓碑后插入：记录归档"}
+            ]},
+            {"name": "beta", "ops": [
+                {"op_id": "B1", "kind": "INSERT", "new_id": "b-RTANK", "anchor": "B", "text": "右翼油箱复查"}
+            ]},
+            {"name": "gamma", "ops": [
+                {"op_id": "G1", "kind": "INSERT", "new_id": "g-WX", "anchor": "FIRST", "text": "最前位气象扫描"}
+            ]},
+            {"name": "zulu", "ops": [
+                {"op_id": "Z1", "kind": "INSERT", "new_id": "z-AIL", "anchor": "B", "text": "双副翼行程复查"},
+                {"op_id": "Z2", "kind": "DELETE", "target": "B"}
+            ]}
+        ]
+    }
+    status, res = http("POST", "/api/merge", four)
+    if status == 200 and res.get("ok"):
+        ids = [r["id"] for r in res["merged"]]
+        om = {(o["branch"], o["op_id"]): o for o in res["outcomes"]}
+        # alpha 整块（a-TOMB 紧随墓碑 B，随后 a-ENG/a-LTANK 块序）最近，再 beta、zulu
+        expected = ["g-WX", "A", "B", "a-TOMB", "a-ENG", "a-LTANK", "b-RTANK", "z-AIL", "C"]
+        check("场景D 四支同锚点插入在统一墓碑序列上按 (分支名,操作标识) 裁定",
+              ids == expected and res["arbitration"]["branch_count"] == 4
+              and res["arbitration"]["branch_order"] == ["alpha", "beta", "gamma", "zulu"],
+              f"合并序={ids} 期望={expected}")
+        check("场景D 非贴近支全部 transformed 且依据列出四支分支序",
+              om[("beta", "B1")]["result"] == "transformed"
+              and om[("zulu", "Z1")]["result"] == "transformed"
+              and "alpha < beta < gamma < zulu" in om[("beta", "B1")]["basis"])
+        check("场景D 跨四支重复删除幂等合并（zulu Z2 并入 alpha A3）",
+              om[("zulu", "Z2")]["result"] == "merged"
+              and om[("zulu", "Z2")]["merged_into"]["op_id"] == "A3")
+        check("场景D 每条原操作都有保留/转换/合并结论",
+              len(res["outcomes"] ) == 8
+              and all(o["result"] in ("kept", "transformed", "merged") for o in res["outcomes"]))
+        # 分组无关：打乱分支提交顺序，合并序必须完全一致
+        shuffled = json.loads(json.dumps(four))
+        shuffled["branches"] = [four["branches"][i] for i in (3, 0, 2, 1)]
+        s2, r2 = http("POST", "/api/merge", shuffled)
+        ids2 = [x["id"] for x in r2["merged"]] if s2 == 200 and r2.get("ok") else None
+        check("场景D 合并序与分支提交分组/顺序无关", ids2 == ids, f"{ids2} vs {ids}")
+    else:
+        check("场景D 四支同锚点并发插入合并通过", False, f"status={status} body={body}")
+
+    # 场景 E：跨第三支冲突 —— alpha 与 gamma 对 A 异替换，beta/zulu 夹在中间
+    cross3 = {
+        "baseline": [
+            {"id": "A", "text": "许可确认"},
+            {"id": "B", "text": "滑行复核"},
+            {"id": "C", "text": "进跑道停顿"}
+        ],
+        "branches": [
+            {"name": "alpha", "ops": [
+                {"op_id": "A1", "kind": "REPLACE", "target": "A", "text": "塔台频率"},
+                {"op_id": "A2", "kind": "DELETE", "target": "C"}
+            ]},
+            {"name": "beta", "ops": [
+                {"op_id": "B1", "kind": "INSERT", "new_id": "b-note", "anchor": "B", "text": "中线偏移记录"}
+            ]},
+            {"name": "gamma", "ops": [
+                {"op_id": "G1", "kind": "REPLACE", "target": "A", "text": "地面频率"},
+                {"op_id": "G2", "kind": "REPLACE", "target": "C", "text": "停顿检查并开灯"}
+            ]},
+            {"name": "zulu", "ops": [
+                {"op_id": "Z1", "kind": "INSERT", "new_id": "z-light", "anchor": "A", "text": "确认后开灯"}
+            ]}
+        ]
+    }
+    status, res = http("POST", "/api/merge", cross3)
+    if status == 200 and isinstance(res, dict) and res.get("ok") is False:
+        c = res["conflict"]
+        check("场景E 跨第三支异替换稳定选出首个冲突双方且不返回局部合并表",
+              c["code"] == "DIVERGENT_REPLACE" and c["ref"] == "A"
+              and c["op_a"]["op_id"] == "A1" and c["op_b"]["op_id"] == "G1"
+              and c["issue_count"] == 2 and "merged" not in res and "outcomes" not in res,
+              f"conflict={c}")
+    else:
+        check("场景E 跨第三支冲突拒绝", False, f"status={status} body={body}")
+
+    # 场景 F：双支回归 —— 双支响应保持原有字段与裁定（rule 原文案、无 branch_count）
+    s2, legacy = http("POST", "/api/merge", concurrent)
+    check("场景F 双支回归：响应字段与裁定规则保持原样",
+          s2 == 200 and legacy.get("ok")
+          and legacy["arbitration"]["rule"] ==
+              "同锚点并发插入按 (分支名, 操作标识) 字典序裁定；分支内保持顺序重放"
+          and "branch_count" not in legacy["arbitration"]
+          and [r["id"] for r in legacy["merged"]]
+              == ["A", "B", "y-TOMB", "x-LTANK", "q-AIL", "p-RTANK", "C"])
 
     # ---- 汇总 --------------------------------------------------------------
     hr("验收汇总")

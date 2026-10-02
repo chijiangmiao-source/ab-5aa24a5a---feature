@@ -1,4 +1,4 @@
-"""飞行试验检查单 —— 双支离线修订的操作变换（OT）领域核心。
+"""飞行试验检查单 —— 多支（2~4 支）离线修订的操作变换（OT）领域核心。
 
 序列模型约定：
 - 每个步骤（基线步骤或某支插入的步骤）在分支状态中只创建一次，占用一个
@@ -7,9 +7,12 @@
   位置漂移。
 - 插入位置完全由锚点标识决定（FIRST 或任一尚存 / 已删 / 本支先前插入的
   步骤），不由下标决定。
-- 双支并发插入同一锚点时，按 (分支名, 操作标识) 稳定裁定：分支名字典序
-  较小的一支整体贴近锚点，分支内部则严格保持本支顺序重放结果（后发生的
-  同锚点插入更贴近锚点）。
+- 多支（2~4 支、分支名唯一）同轮回传时，在**同一条墓碑序列上统一重放与
+  裁定全部操作**，不做两两合并 —— 因而并发插入的相对位置只取决于
+  (分支名, 操作标识)，与分支如何分组、以什么顺序提交无关。
+- 同锚点并发插入按 (分支名, 操作标识) 稳定裁定：分支名字典序较小的一支
+  整体贴近锚点，分支内部则严格保持本支顺序重放结果（后发生的同锚点插入
+  更贴近锚点）。双支（left/right）是该规则的特例，裁定结果保持不变。
 """
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ from typing import Any, Optional
 # 可打印 ASCII（含标点），但不含空白，保证标识可在行格式中安全切分
 ID_RE = re.compile(r"^[!-\x7e]+$")
 MAX_OPS_PER_BRANCH = 80
+MIN_BRANCHES = 2
+MAX_BRANCHES = 4  # 双支检查单扩展上限：同轮回传至多四支
 HEAD = "\x00__FIRST__\x00"  # 首位虚拟锚点：含控制字符，不可能与任何合法 ASCII 标识撞键
 
 KIND_INSERT = "INSERT"
@@ -149,8 +154,9 @@ def parse_request(payload: Any) -> tuple[list[dict[str, str]], dict[str, list[di
         baseline.append({"id": sid, "text": text})
 
     br_raw = payload.get("branches")
-    _require(isinstance(br_raw, list) and len(br_raw) == 2,
-             "branches 必须是恰好两支（left / right）的数组")
+    _require(isinstance(br_raw, list) and MIN_BRANCHES <= len(br_raw) <= MAX_BRANCHES,
+             f"branches 必须是 {MIN_BRANCHES}~{MAX_BRANCHES} 支、分支名唯一的数组"
+             f"（既有双支 left/right 结果不变，至多扩展为四支）")
     branches: dict[str, list[dict[str, Any]]] = {}
     names: set[str] = set()
     for b in br_raw:
@@ -200,8 +206,10 @@ def parse_request(payload: Any) -> tuple[list[dict[str, str]], dict[str, list[di
 # --------------------------------------------------------------------------- #
 # 单支重放（墓碑保留序列模型）
 # --------------------------------------------------------------------------- #
-def replay(name: str, ops_raw: list[dict[str, Any]], baseline: list[dict[str, str]]) -> BranchState:
+def replay(name: str, ops_raw: list[dict[str, Any]], baseline: list[dict[str, str]],
+           n_branches: int = 2) -> BranchState:
     st = BranchState(name=name)
+    peer_word = "对侧分支" if n_branches == 2 else "其他支"
     for b in baseline:
         st.nodes.append(Node(id=b["id"], text=b["text"], origin="baseline"))
     st.by_id = {n.id: n for n in st.nodes}
@@ -251,7 +259,7 @@ def replay(name: str, ops_raw: list[dict[str, Any]], baseline: list[dict[str, st
         if target not in st.by_id:
             code = "DANGLING_TARGET"
             basis = (f"{op.kind} 操作引用的 {target} 在本支重放到第 {seq} 条时不存在"
-                     f"（对侧分支引入的标识不能作为本支引用，属悬空引用）。")
+                     f"（{peer_word}引入的标识不能作为本支引用，属悬空引用）。")
             st.issues.append(Issue([op.loc()], code, basis, op, ref=target))
             continue
         node = st.by_id[target]
@@ -301,6 +309,7 @@ def replay(name: str, ops_raw: list[dict[str, Any]], baseline: list[dict[str, st
 def _cross_issues(states: dict[str, BranchState], baseline: list[dict[str, str]]) -> list[Issue]:
     issues: list[Issue] = []
     names = sorted(states)
+    pair_word = "两支" if len(names) == 2 else "多支"
 
     # 1) 跨支重复新标识（插入标识必须全局唯一）
     seen_insert: dict[str, InsertEvent] = {}
@@ -308,7 +317,7 @@ def _cross_issues(states: dict[str, BranchState], baseline: list[dict[str, str]]
         for ev in states[name].inserts:
             if ev.new_id in seen_insert:
                 prev = seen_insert[ev.new_id]
-                basis = (f"标识 {ev.new_id} 被两支分别插入：{prev.branch} 支 {prev.op.op_id}"
+                basis = (f"标识 {ev.new_id} 被{pair_word}分别插入：{prev.branch} 支 {prev.op.op_id}"
                          f"（#{prev.seq}）与 {ev.branch} 支 {ev.op.op_id}（#{ev.seq}）；"
                          f"插入标识必须全局唯一，拒绝重复新标识。")
                 issues.append(Issue([prev.op.loc(), ev.op.loc()], "DUPLICATE_NEW_ID",
@@ -343,20 +352,21 @@ def _cross_issues(states: dict[str, BranchState], baseline: list[dict[str, str]]
             o1, t1 = reps[0]
             o2 = next(o for o, t in reps[1:] if t != t1)
             first, second = sorted([o1, o2], key=lambda o: (o.branch, o.seq))
-            basis = (f"步骤 {sid} 被两支替换为不同文本（{first.op_id}: "
-                     f"{next(t for o,t in reps if o is first)!r} vs "
-                     f"{second.op_id}: {next(t for o,t in reps if o is second)!r}），"
-                     f"同一槽位最终文本无共识，拒绝异替换。")
+            basis = (f"步骤 {sid} 被{pair_word}替换为不同文本（{first.op_id}: "
+                    f"{next(t for o,t in reps if o is first)!r} vs "
+                    f"{second.op_id}: {next(t for o,t in reps if o is second)!r}），"
+                    f"同一槽位最终文本无共识，拒绝异替换。")
             issues.append(Issue([first.loc(), second.loc()], "DIVERGENT_REPLACE",
                                 basis, first, second, ref=sid))
     return issues
 
 
 def merge(payload: Any) -> dict[str, Any]:
-    """主入口：校验 -> 双支重放 -> 交叉裁定 -> 合并表 + 逐操作结论。"""
+    """主入口：校验 -> 多支统一重放（同一墓碑序列）-> 交叉裁定 -> 合并表 + 逐操作结论。"""
     baseline, branches_raw = parse_request(payload)
     names = sorted(branches_raw)
-    states = {name: replay(name, branches_raw[name], baseline) for name in names}
+    states = {name: replay(name, branches_raw[name], baseline, n_branches=len(names))
+              for name in names}
 
     issues: list[Issue] = []
     for name in names:
@@ -455,10 +465,16 @@ def merge(payload: Any) -> dict[str, Any]:
     for name in names:
         st = states[name]
         own_index = {n.id: i for i, n in enumerate(st.nodes)}
-        concurrent_anchor: dict[Optional[str], list[InsertEvent]] = {}
-        other = names[1] if names[0] == name else names[0]
-        for ev in states[other].inserts:
-            concurrent_anchor.setdefault(ev.anchor, []).append(ev)
+        # 同锚点的并发插入来自其余每一支（多支在同一墓碑序列上统一裁定）
+        peers_by_anchor: dict[Optional[str], list[InsertEvent]] = {}
+        for other in names:
+            if other == name:
+                continue
+            for ev in states[other].inserts:
+                peers_by_anchor.setdefault(ev.anchor, []).append(ev)
+        for evs in peers_by_anchor.values():
+            evs.sort(key=lambda e: (e.branch, e.seq, e.op.op_id))
+        order_text = " < ".join(names)
 
         for op in st.ops:
             if op.op_id in st.merged_into:
@@ -480,20 +496,26 @@ def merge(payload: Any) -> dict[str, Any]:
                 anchor_label = op.anchor if op.anchor is not None else "FIRST"
                 before = own_index[op.new_id]
                 after = merged_index[op.new_id]
-                peers = concurrent_anchor.get(op.anchor, [])
+                peers = peers_by_anchor.get(op.anchor, [])
                 anchor_node = (ordered[merged_index[op.anchor]]
                                if op.anchor is not None else None)
                 moved = before != after
                 if peers:
+                    if len(names) == 2:
+                        order_clause = f"分支序 {names[0]} < {names[1]}，字典序小者整体贴近锚点"
+                    else:
+                        order_clause = (f"分支序 {order_text}（共 {len(names)} 支在同一墓碑序列上"
+                                        f"统一裁定），字典序小者整体贴近锚点")
                     basis = (
                         f"与 {','.join(e.branch + ' 支 ' + e.op.op_id for e in peers)} "
                         f"并发锚定同一锚点 {anchor_label}；按 (分支名, 操作标识) 稳定裁定，"
-                        f"分支序 {names[0]} < {names[1]}，字典序小者整体贴近锚点、分支内保持"
+                        f"{order_clause}、分支内保持"
                         f"顺序重放结果；本插入标识与锚点不变，序列位置 {before} → {after}"
                         f"{'（发生位移，故转换）' if moved else '（恰为贴近锚点一方，位置保留）'}。")
                     result = R_TRANSFORMED if moved else R_KEPT
                 elif moved:
-                    basis = (f"锚点 {anchor_label} 无同锚点并发，但对支在更早序列位置的插入"
+                    other_word = "对支" if len(names) == 2 else "其他支"
+                    basis = (f"锚点 {anchor_label} 无同锚点并发，但{other_word}在更早序列位置的插入"
                              f"使本插入整体后移：序列位置 {before} → {after}，标识与锚点不变，"
                              f"属于并发插入导致的位置转换。")
                     result = R_TRANSFORMED
@@ -510,7 +532,8 @@ def merge(payload: Any) -> dict[str, Any]:
                                  "position_before": before, "position_after": after,
                                  "basis": basis})
             elif op.kind == KIND_DELETE:
-                basis = (f"{op.target} 未被对侧异改：删除生效，节点保留为墓碑锚点，"
+                other_word = "对侧" if len(names) == 2 else "其他支"
+                basis = (f"{op.target} 未被{other_word}异改：删除生效，节点保留为墓碑锚点，"
                          f"合并序列位置 {merged_index[op.target]}，后续锚定不漂移。")
                 outcomes.append({"branch": name, "seq": op.seq, "op_id": op.op_id,
                                  "kind": op.kind, "result": R_KEPT, "target": op.target,
@@ -545,12 +568,19 @@ def merge(payload: Any) -> dict[str, Any]:
             "deleted_by": node.first_del.op_id if node.first_del else None,
         })
 
+    two_branch = len(names) == 2
+    rule = ("同锚点并发插入按 (分支名, 操作标识) 字典序裁定；分支内保持顺序重放"
+            if two_branch else
+            "多支在同一墓碑序列上统一重放；同锚点并发插入按 (分支名, 操作标识) 字典序裁定；分支内保持顺序重放（不做两两合并）")
+    arbitration: dict[str, Any] = {
+        "rule": rule,
+        "branch_order": names,
+    }
+    if not two_branch:  # 双支响应保持原样；多支额外报告支数
+        arbitration["branch_count"] = len(names)
     return {
         "ok": True,
-        "arbitration": {
-            "rule": "同锚点并发插入按 (分支名, 操作标识) 字典序裁定；分支内保持顺序重放",
-            "branch_order": names,
-        },
+        "arbitration": arbitration,
         "merged": merged_rows,
         "outcomes": outcomes,
         "stats": {

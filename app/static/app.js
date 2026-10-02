@@ -74,6 +74,84 @@ const SAMPLES = {
         ]
       }
     ]
+  },
+  fourway: {
+    // 四支同轮回传：在同一墓碑序列上统一裁定；alpha 字典序最小，整体贴近锚点 B。
+    // 注意：即使把四支先两两合并，相对位置也会随分组变化——系统不做两两合并。
+    baseline: [
+      { id: "A", text: "起飞前绕机检查" },
+      { id: "B", text: "确认襟翼处于起飞位" },
+      { id: "C", text: "核对起飞简令" }
+    ],
+    branches: [
+      {
+        name: "alpha",
+        ops: [
+          { op_id: "A1", kind: "INSERT", new_id: "a-LTANK", anchor: "B", text: "左翼油箱油量复查" },
+          { op_id: "A2", kind: "INSERT", new_id: "a-ENG", anchor: "B", text: "左发滑油压力复查" },
+          { op_id: "A3", kind: "DELETE", target: "B" },
+          { op_id: "A4", kind: "INSERT", new_id: "a-TOMB", anchor: "B", text: "B 已删仍锚定其后：襟翼记录归档" }
+        ]
+      },
+      {
+        name: "beta",
+        ops: [
+          { op_id: "B1", kind: "INSERT", new_id: "b-RTANK", anchor: "B", text: "右翼油箱油量复查" }
+        ]
+      },
+      {
+        name: "gamma",
+        ops: [
+          { op_id: "G1", kind: "INSERT", new_id: "g-WX", anchor: "FIRST", text: "最前位：气象雷达最后扫描" },
+          { op_id: "G2", kind: "REPLACE", target: "C", text: "核对起飞简令并双签" }
+        ]
+      },
+      {
+        name: "zulu",
+        ops: [
+          { op_id: "Z1", kind: "INSERT", new_id: "z-AIL", anchor: "B", text: "双副翼行程复查" },
+          { op_id: "Z2", kind: "REPLACE", target: "C", text: "核对起飞简令并双签" }
+        ]
+      }
+    ]
+  },
+  fourconflict: {
+    // 四支中 alpha 与 gamma 对同一基线步骤 A 给出不同替换，
+    // beta、zulu 两支夹在中间（跨第三支冲突）：系统仍稳定选出首个冲突的两条操作，
+    // 不返回任何局部合并表；同时 C 上还埋有删除/替换交叉，但首个冲突必须是 A 那对。
+    baseline: [
+      { id: "A", text: "开车前许可确认" },
+      { id: "B", text: "滑行路线复核" },
+      { id: "C", text: "进入跑道前停顿检查" }
+    ],
+    branches: [
+      {
+        name: "alpha",
+        ops: [
+          { op_id: "A1", kind: "REPLACE", target: "A", text: "开车前许可确认（塔台频率）" },
+          { op_id: "A2", kind: "DELETE", target: "C" }
+        ]
+      },
+      {
+        name: "beta",
+        ops: [
+          { op_id: "B1", kind: "INSERT", new_id: "b-note", anchor: "B", text: "滑行中线偏移量记录" }
+        ]
+      },
+      {
+        name: "gamma",
+        ops: [
+          { op_id: "G1", kind: "REPLACE", target: "A", text: "开车前许可确认（地面频率）" },
+          { op_id: "G2", kind: "REPLACE", target: "C", text: "进入跑道前停顿检查并开灯" }
+        ]
+      },
+      {
+        name: "zulu",
+        ops: [
+          { op_id: "Z1", kind: "INSERT", new_id: "z-light", anchor: "A", text: "许可确认后开启着陆灯" }
+        ]
+      }
+    ]
   }
 };
 
@@ -190,8 +268,12 @@ function renderMerged(res) {
     </tr>`;
   }).join("");
   const s = res.stats;
+  const opsLine = res.arbitration.branch_order
+    .map((n) => `${n} ${s.ops[n] ?? 0} 条`)
+    .join(" / ");
+  const count = res.arbitration.branch_count ?? 2;
   $("stats-line").textContent =
-    `基线 ${s.baseline} 条；操作 left ${s.ops.left ?? 0} 条 / right ${s.ops.right ?? 0} 条；` +
+    `基线 ${s.baseline} 条；本次 ${count} 支操作：${opsLine}；` +
     `可执行步骤 ${s.live} 条，墓碑保留 ${s.tombstones} 个。`;
 }
 
