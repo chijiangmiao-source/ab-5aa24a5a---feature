@@ -74,6 +74,71 @@ const SAMPLES = {
         ]
       }
     ]
+  },
+  four: {
+    baseline: [
+      { id: "A", text: "起飞前绕机检查" },
+      { id: "B", text: "确认襟翼处于起飞位" },
+      { id: "C", text: "核对起飞简令" }
+    ],
+    branches: [
+      {
+        name: "zulu",
+        ops: [
+          { op_id: "Z1", kind: "INSERT", new_id: "z-FUEL", anchor: "B", text: "综合油量终核（zulu 支）" }
+        ]
+      },
+      {
+        name: "alpha",
+        ops: [
+          { op_id: "A1", kind: "INSERT", new_id: "a-LTANK", anchor: "B", text: "左翼油箱复查" },
+          { op_id: "A2", kind: "INSERT", new_id: "a2-RTANK", anchor: "B", text: "右翼油箱复查" },
+          { op_id: "A3", kind: "DELETE", target: "B" },
+          { op_id: "A4", kind: "INSERT", new_id: "a3-ARCH", anchor: "B", text: "B 已删仍锚定其后：归档留存" }
+        ]
+      },
+      {
+        name: "mid",
+        ops: [
+          { op_id: "M1", kind: "INSERT", new_id: "m-AIL", anchor: "B", text: "副翼行程复查" }
+        ]
+      },
+      {
+        name: "bravo",
+        ops: [
+          { op_id: "V1", kind: "INSERT", new_id: "v-WX", anchor: "FIRST", text: "最前位：气象雷达终扫" },
+          { op_id: "V2", kind: "REPLACE", target: "C", text: "核对起飞简令并双签" }
+        ]
+      }
+    ]
+  },
+  third: {
+    baseline: [
+      { id: "A", text: "开车前许可确认" },
+      { id: "B", text: "滑行路线复核" }
+    ],
+    branches: [
+      {
+        name: "left",
+        ops: [
+          { op_id: "L1", kind: "REPLACE", target: "A", text: "开车前许可确认（塔台频率）" }
+        ]
+      },
+      {
+        name: "right",
+        ops: [
+          { op_id: "R1", kind: "REPLACE", target: "A", text: "开车前许可确认（塔台频率）" },
+          { op_id: "R2", kind: "REPLACE", target: "B", text: "滑行路线复核并开灯" }
+        ]
+      },
+      {
+        name: "third",
+        ops: [
+          { op_id: "T1", kind: "REPLACE", target: "A", text: "开车前许可确认（地面频率）" },
+          { op_id: "T2", kind: "DELETE", target: "B" }
+        ]
+      }
+    ]
   }
 };
 
@@ -190,8 +255,11 @@ function renderMerged(res) {
     </tr>`;
   }).join("");
   const s = res.stats;
+  const opsLine = res.arbitration.branch_order
+    .map((n) => `${n} ${s.ops[n] ?? 0} 条`)
+    .join(" / ");
   $("stats-line").textContent =
-    `基线 ${s.baseline} 条；操作 left ${s.ops.left ?? 0} 条 / right ${s.ops.right ?? 0} 条；` +
+    `基线 ${s.baseline} 条；参与裁定 ${res.arbitration.branch_order.length} 支，操作 ${opsLine}；` +
     `可执行步骤 ${s.live} 条，墓碑保留 ${s.tombstones} 个。`;
 }
 

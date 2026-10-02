@@ -16,6 +16,15 @@ def mk(baseline, left=(), right=(), lname="left", rname="right"):
     }
 
 
+def mkn(baseline, branches):
+    """N 支请求：branches 为 [(name, [op, ...]), ...]，2~4 支。"""
+    return {
+        "baseline": [{"id": i, "text": f"步骤{i}"} if isinstance(i, str) else i
+                     for i in baseline],
+        "branches": [{"name": n, "ops": list(ops)} for n, ops in branches],
+    }
+
+
 def ins(op_id, new_id, anchor, text=None):
     d = {"op_id": op_id, "kind": "INSERT", "new_id": new_id,
          "anchor": anchor or "FIRST", "text": text or f"文本{new_id}"}
@@ -318,6 +327,193 @@ class TestOutcomeCompleteness(unittest.TestCase):
         # 合并表中每个存活步骤序号连续且从 1 开始
         live = [row["step_no"] for row in r["merged"] if row["step_no"] is not None]
         self.assertEqual(live, list(range(1, len(live) + 1)))
+
+
+class TestMultiBranch(unittest.TestCase):
+    """三 / 四支同轮回传：统一墓碑序列，禁止两两分组。"""
+
+    def test_three_branch_same_anchor_block_order(self):
+        # 三支各向 B 后插入；分支块按分支名贴近锚点，块内保持重放序
+        payload = mkn(["A", "B", "C"], [
+            ("zulu",  [ins("Z1", "z1", "B")]),
+            ("alpha", [ins("A1", "a1", "B"), ins("A2", "a2", "B")]),
+            ("mid",   [ins("M1", "m1", "B")]),
+        ])
+        r = domain.merge(payload)
+        self.assertTrue(r["ok"], r)
+        # alpha 块（块内后插的 a2 更贴近 B）→ mid → zulu
+        self.assertEqual(all_ids(r), ["A", "B", "a2", "a1", "m1", "z1", "C"])
+        self.assertEqual(r["arbitration"]["branch_order"], ["alpha", "mid", "zulu"])
+        om = outcome_map(r)
+        # alpha 块最贴近锚点：a2 位置保留；a1 被本支 a2 顶开属块内重放序保留
+        self.assertEqual(om[("alpha", "A1")]["result"], domain.R_KEPT)
+        self.assertEqual(om[("alpha", "A2")]["result"], domain.R_KEPT)
+        self.assertEqual(om[("mid", "M1")]["result"], domain.R_TRANSFORMED)
+        self.assertEqual(om[("zulu", "Z1")]["result"], domain.R_TRANSFORMED)
+        # 依据必须列出全部参与裁定的分支
+        self.assertIn("alpha < mid < zulu", om[("zulu", "Z1")]["basis"])
+
+    def test_four_branch_same_anchor_at_FIRST(self):
+        payload = mkn(["A"], [
+            ("b4", [ins("B1", "b", None)]),
+            ("a1", [ins("A1", "a", None)]),
+            ("c2", [ins("C1", "c", None), ins("C2", "c2", None)]),
+            ("d3", [ins("D1", "d", None)]),
+        ])
+        r = domain.merge(payload)
+        self.assertTrue(r["ok"], r)
+        # a1 块 → b4 块（单条 b）→ c2 块（块内后插的 c2 更贴近首位）→ d3 块，然后基线 A
+        self.assertEqual(all_ids(r), ["a", "b", "c2", "c", "d", "A"])
+
+    def test_four_branch_interleaved_anchors(self):
+        # 不同锚点的插入递归展开，整体顺序不依赖分支分组方式
+        payload = mkn(["A", "B", "C"], [
+            ("b1", [ins("B1", "ba", "A"), ins("B2", "bb", "ba")]),
+            ("b2", [ins("X1", "x", "C")]),
+            ("b3", [ins("Y1", "y", "B")]),
+            ("b4", [ins("Z1", "z", None)]),
+        ])
+        r = domain.merge(payload)
+        self.assertTrue(r["ok"], r)
+        # z @ FIRST；A, ba, bb（ba 后）；B, y；C, x
+        self.assertEqual(all_ids(r), ["z", "A", "ba", "bb", "B", "y", "C", "x"])
+
+    def test_arbitration_independent_of_request_grouping(self):
+        # 同一批分支以两种排列顺序提交，规范合并序必须完全一致
+        branches = [
+            ("zulu",  [ins("Z1", "z1", "B"), dele("Z2", "A")]),
+            ("alpha", [ins("A1", "a1", "B"), rep("A2", "C", "共同新文")]),
+            ("mid",   [ins("M1", "m1", "B"), rep("M2", "C", "共同新文")]),
+        ]
+        r1 = domain.merge(mkn(["A", "B", "C"], branches))
+        r2 = domain.merge(mkn(["A", "B", "C"], list(reversed(branches))))
+        self.assertTrue(r1["ok"], r1)
+        self.assertTrue(r2["ok"], r2)
+        self.assertEqual(all_ids(r1), all_ids(r2))
+        self.assertEqual(live_ids(r1), live_ids(r2))
+        self.assertEqual(r1["arbitration"]["branch_order"],
+                         r2["arbitration"]["branch_order"])
+
+    def test_cross_third_branch_divergent_replace(self):
+        # left/right 一致替换，第三支给出不同文本：必须拒绝且报稳定的首对
+        payload = mkn(["A"], [
+            ("left",   [rep("L1", "A", "塔台频率")]),
+            ("right",  [rep("R1", "A", "塔台频率")]),
+            ("third",  [rep("T9", "A", "地面频率")]),
+        ])
+        r = domain.merge(payload)
+        self.assertFalse(r["ok"])
+        c = r["conflict"]
+        self.assertEqual(c["code"], "DIVERGENT_REPLACE")
+        self.assertEqual(c["op_a"]["op_id"], "L1")
+        self.assertEqual(c["op_b"]["op_id"], "T9")
+        self.assertEqual(c["ref"], "A")
+        # 冲突时不得返回局部合并表
+        self.assertNotIn("merged", r)
+        self.assertNotIn("outcomes", r)
+
+    def test_delete_replace_conflict_across_third_branch(self):
+        payload = mkn(["A"], [
+            ("left",  []),
+            ("right", [dele("R5", "A")]),
+            ("third", [rep("T1", "A", "新文本")]),
+        ])
+        r = domain.merge(payload)
+        self.assertFalse(r["ok"])
+        c = r["conflict"]
+        self.assertEqual(c["code"], "DELETE_REPLACE_CONFLICT")
+        self.assertEqual(c["op_a"]["op_id"], "R5")
+        self.assertEqual(c["op_b"]["op_id"], "T1")
+
+    def test_duplicate_new_id_among_three_branches(self):
+        payload = mkn(["A"], [
+            ("left",  [ins("L1", "dup", "A")]),
+            ("mid",   [ins("M1", "other", "A")]),
+            ("right", [ins("R1", "dup", "A")]),
+        ])
+        r = domain.merge(payload)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["conflict"]["code"], "DUPLICATE_NEW_ID")
+        self.assertEqual(r["conflict"]["op_a"]["op_id"], "L1")
+        self.assertEqual(r["conflict"]["op_b"]["op_id"], "R1")
+
+    def test_duplicate_new_id_chain_reports_first_pair(self):
+        # 同一新标识出现三次：首个冲突取前两支
+        payload = mkn(["A"], [
+            ("b1", [ins("O1", "dup", "A")]),
+            ("b2", [ins("O2", "dup", "A")]),
+            ("b3", [ins("O3", "dup", "A")]),
+        ])
+        r = domain.merge(payload)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["conflict"]["op_a"]["op_id"], "O1")
+        self.assertEqual(r["conflict"]["op_b"]["op_id"], "O2")
+        self.assertEqual(r["conflict"]["issue_count"], 2)
+
+    def test_dangling_anchor_in_fourth_branch(self):
+        payload = mkn(["A"], [
+            ("b1", []), ("b2", []), ("b3", []),
+            ("b4", [ins("X1", "x", "GHOST")]),
+        ])
+        r = domain.merge(payload)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["conflict"]["code"], "DANGLING_ANCHOR")
+        self.assertEqual(r["conflict"]["ref"], "GHOST")
+
+    def test_multi_branch_idempotent_merge(self):
+        # 四支同删 A、三支同文替换 B：仅各保留 (分支名, op_id) 最小者，其余合并
+        payload = mkn(["A", "B"], [
+            ("b1", [dele("D1", "A"), rep("P1", "B", "共同")]),
+            ("b2", [dele("D2", "A"), rep("P2", "B", "共同")]),
+            ("b3", [dele("D3", "A")]),
+            ("b4", [dele("D4", "A"), rep("P4", "B", "共同")]),
+        ])
+        r = domain.merge(payload)
+        self.assertTrue(r["ok"], r)
+        om = outcome_map(r)
+        self.assertEqual(om[("b1", "D1")]["result"], domain.R_KEPT)
+        for bid, oid in [("b2", "D2"), ("b3", "D3"), ("b4", "D4")]:
+            self.assertEqual(om[(bid, oid)]["result"], domain.R_MERGED)
+            self.assertEqual(om[(bid, oid)]["merged_into"]["op_id"], "D1")
+        self.assertEqual(om[("b1", "P1")]["result"], domain.R_KEPT)
+        self.assertEqual(om[("b2", "P2")]["result"], domain.R_MERGED)
+        self.assertEqual(om[("b4", "P4")]["result"], domain.R_MERGED)
+
+    def test_every_op_classified_with_four_branches(self):
+        payload = mkn(["A", "B"], [
+            ("b1", [ins("I1", "i1", "A"), dele("X1", "B")]),
+            ("b2", [ins("I2", "i2", "A")]),
+            ("b3", [ins("I3", "i3", "A"), dele("X3", "B")]),
+            ("b4", [ins("I4", "i4", "A")]),
+        ])
+        r = domain.merge(payload)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(len(r["outcomes"]), 6)
+        self.assertTrue(all(o["result"] in ("kept", "transformed", "merged")
+                            for o in r["outcomes"]))
+        live = [row["step_no"] for row in r["merged"] if row["step_no"] is not None]
+        self.assertEqual(live, list(range(1, len(live) + 1)))
+
+
+class TestBranchCountValidation(unittest.TestCase):
+    def test_reject_one_branch(self):
+        with self.assertRaises(domain.OTReject):
+            domain.merge(mkn(["A"], [("left", [])]))
+
+    def test_reject_five_branches(self):
+        with self.assertRaises(domain.OTReject):
+            domain.merge(mkn(["A"], [(f"b{i}", []) for i in range(5)]))
+
+    def test_reject_duplicate_branch_names_among_four(self):
+        payload = mkn(["A"], [("same", []), ("b2", []), ("same", []), ("b4", [])])
+        with self.assertRaises(domain.OTReject):
+            domain.merge(payload)
+
+    def test_accept_two_three_four_branches(self):
+        for n in (2, 3, 4):
+            r = domain.merge(mkn(["A"], [(f"b{i}", []) for i in range(n)]))
+            self.assertTrue(r["ok"], n)
+            self.assertEqual(len(r["arbitration"]["branch_order"]), n)
 
 
 if __name__ == "__main__":
